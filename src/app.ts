@@ -9,11 +9,12 @@ import {
 } from "@aws-sdk/client-s3";
 import tar from "tar-stream";
 import zlib from "zlib";
-import stream from "stream";
+import { PassThrough } from "stream";
 import { promisify } from "util";
 import fs from "fs";
 import { pipeline } from "stream/promises";
 import { S3ReadStream } from "s3-readstream";
+import { Upload } from "@aws-sdk/lib-storage";
 
 const client = new S3Client({
     credentials: {
@@ -31,6 +32,33 @@ async function getKeysInBucket() {
     return response.Contents?.map((content) => content.Key);
 }
 
+const DST_KEY = "archive.tar.gz";
+
+async function getWriteableUploadStream() {
+    //
+    const passThrough = new PassThrough({
+        highWaterMark: 1024 * 1024 * 1000,
+    });
+
+    const upload = new Upload({
+        client,
+        params: {
+            Bucket: bucket,
+            Key: DST_KEY,
+            Body: passThrough,
+        },
+        queueSize: 4,
+        partSize: 1024 * 1024 * 5,
+        leavePartsOnError: false,
+    })
+        .on("httpUploadProgress", (progress) => {
+            console.log("progress", progress);
+        })
+        .done();
+
+    return { writableStream: passThrough, upload };
+}
+
 async function main() {
     const pack = tar.pack();
     const gzip = zlib.createGzip();
@@ -40,8 +68,12 @@ async function main() {
         fs.mkdirSync("./dl");
     }
 
-    const keys = await getKeysInBucket();
-    const tarGzWriteStream = fs.createWriteStream(tarGzFilePath);
+    let keys = await getKeysInBucket();
+    keys = keys.filter((key) => key.endsWith(".png"));
+
+    console.log("keys", keys);
+    // const tarGzWriteStream = fs.createWriteStream(tarGzFilePath);
+    const { writableStream, upload } = await getWriteableUploadStream();
 
     for (const key of keys) {
         const s3Params = {
@@ -63,7 +95,8 @@ async function main() {
 
         const entry = pack.entry(
             { name: key, size: headObject.ContentLength },
-            function (err) {
+            (err) => {
+                console.log("entry end", key);
                 if (err) {
                     console.error("Error adding entry to tar pack:", err);
                     return;
@@ -77,7 +110,8 @@ async function main() {
 
     pack.finalize();
 
-    await pipeline(pack, gzip, tarGzWriteStream);
+    await pipeline(pack, gzip, writableStream);
+    await upload;
 }
 
 main().catch(console.error);
